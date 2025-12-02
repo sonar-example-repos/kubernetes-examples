@@ -20,3 +20,5 @@ jobs:
         with:
           args: >
             -Dsonar.host.url=https://sc-staging.io/
+            -Dsonar.exclusions=**/*.java
+            -Dsonar.c.file.suffixes=-
