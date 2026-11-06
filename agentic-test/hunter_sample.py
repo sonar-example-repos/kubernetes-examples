@@ -1,40 +1,103 @@
-"""Small sample with intentional cross-function vulnerabilities, used to exercise the SonarQube Hunter Agent.
+"""Small shop API with intentional design flaws, used to exercise the SonarQube Hunter Agent.
 
-The user input is read in one function and reaches the sink in another, so the flaws need data-flow
-reasoning across functions rather than a single-line pattern match.
+Hunter looks for broken access control, business logic and authentication/session flaws. Those are
+missing or wrong rules (who may do what, what the server trusts), not tainted data reaching a sink, so
+none of them is visible to a single-line pattern matcher.
 """
-import os
-import sqlite3
+import hashlib
+import time
+
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+USERS = {
+    1: {"name": "alice", "role": "customer", "password": "alice-pw", "balance": 100},
+    2: {"name": "bob", "role": "customer", "password": "bob-pw", "balance": 100},
+    3: {"name": "root", "role": "admin", "password": "root-pw", "balance": 0},
+}
+ORDERS = {}
+COUPONS = {"WELCOME10": {"percent": 10, "used_by": set()}}
+SESSIONS = {}
 
 
-def read_request_param(request, name):
-    # untrusted input enters here
-    return request.args.get(name, "")
+# --- authentication and session -------------------------------------------------------------
+
+def make_token(user_id):
+    # predictable: md5 of the user id and the current second, easy to guess for any user
+    return hashlib.md5(f"{user_id}{int(time.time())}".encode()).hexdigest()
 
 
-def build_lookup_query(username):
-    # taint flows from the request into the SQL text unescaped
-    return "SELECT id, email FROM users WHERE name = '" + username + "'"
+@app.post("/login")
+def login():
+    body = request.get_json()
+    for user_id, user in USERS.items():
+        if user["name"] == body["name"] and user["password"] == body["password"]:
+            token = make_token(user_id)
+            SESSIONS[token] = user_id  # never expires, never rotated, survives logout
+            return jsonify(token=token)
+    return jsonify(error="bad credentials"), 401  # no rate limit or lockout, unlimited guessing
 
 
-def find_user(request, db_path="app.db"):
-    username = read_request_param(request, "user")
-    query = build_lookup_query(username)
-    with sqlite3.connect(db_path) as conn:
-        return conn.execute(query).fetchall()  # SQL injection
+@app.post("/logout")
+def logout():
+    return jsonify(ok=True)  # the token is not removed from SESSIONS, so it stays valid
 
 
-def resolve_report_path(report_dir, filename):
-    # no normalization, so "../" escapes report_dir
-    return os.path.join(report_dir, filename)
+def current_user_id():
+    return SESSIONS.get(request.headers.get("X-Token"))
 
 
-def read_report(request, report_dir="/var/app/reports"):
-    filename = read_request_param(request, "file")
-    with open(resolve_report_path(report_dir, filename)) as handle:  # path traversal
-        return handle.read()
+# --- broken access control ------------------------------------------------------------------
+
+@app.get("/orders/<int:order_id>")
+def get_order(order_id):
+    if current_user_id() is None:
+        return jsonify(error="login required"), 401
+    return jsonify(ORDERS[order_id])  # any logged-in user can read any order: no owner check
 
 
-def run_diagnostics(request):
-    host = read_request_param(request, "host")
-    return os.popen("ping -c 1 " + host).read()  # OS command injection
+@app.post("/users/<int:user_id>")
+def update_user(user_id):
+    if current_user_id() is None:
+        return jsonify(error="login required"), 401
+    USERS[user_id].update(request.get_json())  # any user can edit any user, including "role": "admin"
+    return jsonify(ok=True)
+
+
+@app.post("/admin/refund/<int:order_id>")
+def refund(order_id):
+    order = ORDERS[order_id]  # endpoint is reachable by everyone: it never checks the admin role
+    USERS[order["user_id"]]["balance"] += order["total"]
+    return jsonify(ok=True)
+
+
+# --- business logic -------------------------------------------------------------------------
+
+@app.post("/orders")
+def create_order():
+    user_id = current_user_id()
+    if user_id is None:
+        return jsonify(error="login required"), 401
+    body = request.get_json()
+    # price and quantity come from the client: a negative quantity or a price of 0 pays nothing,
+    # and a negative total credits the buyer
+    total = body["unit_price"] * body["quantity"]
+
+    coupon = COUPONS.get(body.get("coupon"))
+    if coupon:
+        total -= total * coupon["percent"] / 100
+        # "used_by" is checked nowhere, so the single-use coupon applies on every order
+
+    order_id = len(ORDERS) + 1
+    ORDERS[order_id] = {"user_id": user_id, "total": total}
+    USERS[user_id]["balance"] -= total  # no check that the balance covers the total
+    return jsonify(order_id=order_id, total=total)
+
+
+@app.post("/orders/<int:order_id>/cancel")
+def cancel_order(order_id):
+    user_id = current_user_id()
+    order = ORDERS[order_id]
+    USERS[user_id]["balance"] += order["total"]  # refunds every time it is called: no state check,
+    return jsonify(ok=True)                      # so one order can be cancelled repeatedly for credit
