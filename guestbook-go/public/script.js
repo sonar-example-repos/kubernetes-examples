@@ -34,7 +34,7 @@ $(document).ready(function() {
 
   submitElement.click(handleSubmission);
   formElement.submit(handleSubmission);
-  hostAddressElement.append(document.URL);
+  hostAddressElement.text(document.URL);
 
   // Poll every second.
   (function fetchGuestbook() {
